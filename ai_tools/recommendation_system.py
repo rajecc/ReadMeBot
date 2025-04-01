@@ -1,4 +1,6 @@
+import time
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from googletrans import Translator
 from sentence_transformers import SentenceTransformer, util
 from typing import List, Dict
 from database.database import load_recommendation_history, save_recommendation_history
@@ -7,25 +9,28 @@ from database.database import load_recommendation_history, save_recommendation_h
 from ai_tools.analyze_system import extract_tags_and_genres
 from ai_tools.summarize_system import compress_text
 
-# Инициализация моделей перевода и сравнения
-tokenizer = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-ru-en")
-translation_model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-ru-en")
-similarity_model = SentenceTransformer('all-MiniLM-L6-v2')  # Для вычисления косинусного сходства
+similarity_model = SentenceTransformer("all-MiniLM-L6-v2")
 
+def format_books(book_list):
+    """
+    Форматирует список книг в читаемый вид.
+    
+    :param book_list: список книг, где каждая книга представлена словарем с ключами 'title' и 'authors'
+    :return: строка с форматированным списком книг
+    """
+    formatted_books = []
+    for book in book_list:
+        title = book.get("Title", "Без названия")
+        authors = book.get("Authors", "Без автора").replace("By ", "").strip()
+        formatted_books.append(f"📖 {title}\n   Автор: {authors}\n")
+    
+    return "\n".join(formatted_books)
 
 # ------------------------------
 # Функция для перевода текста с русского на английский
 def translate_to_english(text: str) -> str:
-    """
-    Перевести текст с русского на английский.
-    """
-    input_text = f">>en<< {text}"
-    input_ids = tokenizer.encode(input_text, return_tensors="pt", max_length=512, truncation=True)
-    output_ids = translation_model.generate(input_ids, max_length=512, num_beams=4, early_stopping=True)
-    translated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    print(f"Translated to English: {translated_text}")
-    return translated_text
-
+    translator = Translator()
+    return translator.translate(text, dest='en').text
 
 # ------------------------------
 # Функция для вычисления косинусного сходства между двумя текстами
@@ -49,6 +54,7 @@ def get_preferences_from_input(user_input: str) -> Dict[str, List[str]]:
     # Переводим ввод (если база на английском, можно оставить теги на английском)
     translated_input = translate_to_english(user_input)
     extracted_data = extract_tags_and_genres(translated_input)
+    print(extracted_data)
     return extracted_data
 
 
@@ -64,12 +70,12 @@ def get_preferences_from_history(selected_history: str) -> Dict[str, List[str]]:
 
     # Извлекаем теги и жанры из сжатого текста
     extracted_data = extract_tags_and_genres(compressed_text)
+    print(extracted_data)
     all_tags.extend(extracted_data.get('tags', []))
     all_genres.extend(extracted_data.get('genres', []))
 
     # Убираем дубликаты
-    return {"tags": list(set(all_tags)), "genres": list(set(all_genres))}
-
+    return {"tags": list(set(all_tags)), "genres": list(set(all_genres))}, compressed_text
 
 # ------------------------------
 # Функция для объединения предпочтений (если учтены и ввод, и история)
@@ -81,82 +87,156 @@ def combine_preferences(pref_input: Dict[str, List[str]], pref_history: Dict[str
     combined_genres = list(set(pref_input.get("genres", []) + pref_history.get("genres", [])))
     return {"tags": combined_tags, "genres": combined_genres}
 
-def search_books_1_mode(selected_history, dataset):
-    pref_history = get_preferences_from_history(selected_history)
-    # Фильтрация по тегам и жанрам
-    filtered_books = dataset[dataset['category'].apply(lambda x:
-                                                       any(tag in x for tag in pref_history['tags']) or
-                                                       any(genre in x for genre in pref_history['genres']))]
-    # Сравнение с полными описаниями
-    scored_books = []
-    for _, row in filtered_books.iterrows():
-        # Сравниваем описание книги с текстом пользователя и историей книг
-        similarity_score_history = compute_similarity(selected_history, row['description'])
-        if similarity_score_history > 0:
-            scored_books.append(
-                {'title': row['title'], 'similarity': similarity_score_history, 'description': row['description']})
+def compute_similarity(text1: str, text2: str) -> float:
+    """
+    Вычислить косинусное сходство между двумя текстами с использованием эмбеддингов.
+    """
+    embeddings1 = similarity_model.encode([text1], convert_to_tensor=True)
+    embeddings2 = similarity_model.encode([text2], convert_to_tensor=True)
+    cosine_similarity = util.pytorch_cos_sim(embeddings1, embeddings2)
+    return cosine_similarity.item()
 
-    # Сортируем книги по убыванию схожести
-    scored_books = sorted(scored_books, key=lambda x: x['similarity'], reverse=True)
-    return scored_books[:5]
+def combine_preferences(pref_input, pref_history):
+    """
+    Объединить теги и жанры, полученные из пользовательского ввода и истории.
+    """
+    combined_tags = list(set(pref_input.get("tags", []) + pref_history.get("tags", [])))
+    combined_genres = list(set(pref_input.get("genres", []) + pref_history.get("genres", [])))
+    return {"tags": combined_tags, "genres": combined_genres}
+
+def filter_books_by_tags(dataset, preferences, max_candidates=40):
+    """Фильтрует книги по тегам и оставляет не более max_candidates книг."""
+    filtered_books = dataset[dataset["category"].apply(lambda x: any(pref in x for pref in preferences))].copy()
+    return filtered_books.sample(min(len(filtered_books), max_candidates))  # Оставляем не более 20 книг
+
+def search_books_1_mode(selected_history, dataset):
+    start_time = time.time()
+    """Сравнивает сжатый текст книги с 20 отфильтрованными книгами по тегам и выбирает топ-5."""
+    pref_history, compressed_text = get_preferences_from_history(selected_history)
+    preferences = pref_history["tags"] + pref_history["genres"]
+    
+    filtered_books = filter_books_by_tags(dataset, preferences)
+
+    filtered_books["similarity"] = filtered_books["Description"].apply(lambda x: compute_similarity(compressed_text, x))
+
+    top_books = filtered_books.sort_values(by="similarity", ascending=False).head(5)
+    recommendations = top_books[["Title", "Authors"]].to_dict(orient="records")
+    for _, book in top_books.iterrows():
+        print(f"{book['Title']} - {book['Authors']}, Similarity: {book['similarity']}")
+    # recommendations_str = "; ".join(f"{book['Title']} - {book['Authors']}" for book in recommendations)
+    print(f"Execution time: {time.time() - start_time:.4f} seconds")
+    return recommendations
 
 def search_books_2_mode(user_input, dataset):
+    """Сравнивает пользовательский ввод с 20 отфильтрованными книгами по тегам и выбирает топ-5."""
     pref_input = get_preferences_from_input(user_input)
-    # Фильтрация по тегам и жанрам
-    filtered_books = dataset[dataset['category'].apply(lambda x:
-                                                       any(tag in x for tag in pref_input['tags']) or
-                                                       any(genre in x for genre in pref_input['genres']))]
-    # Сравнение с полными описаниями
-    scored_books = []
-    for _, row in filtered_books.iterrows():
-        # Сравниваем описание книги с текстом пользователя и историей книг
-        similarity_score_input = compute_similarity(user_input, row['description'])
-        if similarity_score_input > 0:
-            scored_books.append(
-                {'title': row['title'], 'similarity': similarity_score_input, 'description': row['description']})
+    preferences = pref_input["tags"] + pref_input["genres"]
 
-    # Сортируем книги по убыванию схожести
-    scored_books = sorted(scored_books, key=lambda x: x['similarity'], reverse=True)
-    return scored_books[:5]
+    filtered_books = filter_books_by_tags(dataset, preferences)
+
+    filtered_books["similarity"] = filtered_books["Description"].apply(lambda x: compute_similarity(user_input, x))
+        
+    top_books = filtered_books.sort_values(by="similarity", ascending=False).head(5)
+    recommendations = top_books[["Title", "Authors"]].to_dict(orient="records")
+    for _, book in top_books.iterrows():
+        print(f"{book['Title']} - {book['Authors']}, Similarity: {book['similarity']}")
+
+    return recommendations
 
 def search_books_3_mode(user_input, selected_history, dataset):
-    """
-    Поиск книг в базе с учетом категории и вычисления косинусного сходства между описаниями книг и текстами ввода/истории.
-    """
-    # Получаем предпочтения из ввода и истории
+    """Объединяет предпочтения из ввода и истории, фильтрует 20 книг по тегам и выбирает топ-5."""
     pref_input = get_preferences_from_input(user_input)
     pref_history = get_preferences_from_history(selected_history)
+    pref_combine = combine_preferences(pref_input, pref_history)
+    preferences = pref_combine["tags"] + pref_combine["genres"]
 
-    # Объединяем предпочтения
-    combined_preferences = combine_preferences(pref_input, pref_history)
+    filtered_books = filter_books_by_tags(dataset, preferences)
 
-    # Формируем строку для поиска
-    user_representation = user_input  # Текст ввода пользователя
-    history_representation = selected_history  # Описание книги из истории
+    filtered_books["similarity"] = filtered_books["Description"].apply(lambda x: compute_similarity(user_input, x))
 
-    # Отбираем книги по категориям (используем столбец 'category')
-    filtered_books = dataset[dataset['category'].apply(lambda x:
-                                                       any(tag in x for tag in combined_preferences['tags']) or
-                                                       any(genre in x for genre in combined_preferences['genres']))]
+    top_books = filtered_books.sort_values(by="similarity", ascending=False).head(5)
+    recommendations = top_books[["Title", "Authors"]].to_dict(orient="records")
+    for _, book in top_books.iterrows():
+        print(f"{book['Title']} - {book['Authors']}, Similarity: {book['similarity']}")
+    return recommendations
 
-    # Сравнение с полными описаниями
-    scored_books = []
-    for _, row in filtered_books.iterrows():
-        # Сравниваем описание книги с текстом пользователя и историей книг
-        similarity_score_input = compute_similarity(user_representation, row['description'])
-        similarity_score_history = compute_similarity(history_representation, row['description'])
 
-        # Общий балл схожести
-        total_similarity = max(similarity_score_input, similarity_score_history)
+# def search_books_1_mode(selected_history, dataset):
+#     pref_history = get_preferences_from_history(selected_history)
+#     preferences = pref_history["tags"] + pref_history["genres"]
+    
+#     # Фильтруем книги, оставляя только те, которые содержат хотя бы одно совпадение с предпочтениями
+#     filtered_books = dataset[dataset["category"].apply(lambda x: any(pref in x for pref in preferences))].copy()
+#     print(filtered_books)
+    
+#     # Подсчет количества совпадений
+#     filtered_books["match_count"] = filtered_books["category"].apply(lambda x: sum(pref in x for pref in preferences))
+    
+#     # Сортировка по количеству совпадений в убывающем порядке
+#     top_books = filtered_books.sort_values(by="match_count", ascending=False).head(5)
+    
+#     # Формируем список словарей с книгами
+#     recommendations = top_books[["Title", "Authors"]].to_dict(orient="records")
+#     print(recommendations)
 
-        if total_similarity > 0:
-            scored_books.append(
-                {'title': row['title'], 'similarity': total_similarity, 'description': row['description']})
+#     # Объединяем книги в строку "Название - Автор" с разделителем "; "
+#     recommendations_str = "; ".join(f"{book['Title']} - {book['Authors']}" for book in recommendations)
+#     print(recommendations_str)
 
-    # Сортируем книги по убыванию схожести
-    scored_books = sorted(scored_books, key=lambda x: x['similarity'], reverse=True)
-    return scored_books[:5]
+#     return recommendations,recommendations_str
+# def search_books_2_mode(user_input, dataset):
+#     pref_input = get_preferences_from_input(user_input)
+    
+#     # Объединяем теги и жанры в один список
+#     preferences = pref_input["tags"] + pref_input["genres"]
+    
+#     # Фильтруем книги, оставляя только те, которые содержат хотя бы одно совпадение с предпочтениями
+#     filtered_books = dataset[dataset["category"].apply(lambda x: any(pref in x for pref in preferences))].copy()
+#     print(filtered_books)
+    
+#     # Подсчет количества совпадений
+#     filtered_books["match_count"] = filtered_books["category"].apply(lambda x: sum(pref in x for pref in preferences))
+    
+#     # Сортировка по количеству совпадений в убывающем порядке
+#     top_books = filtered_books.sort_values(by="match_count", ascending=False).head(5)
+    
+#     # Формируем список словарей с книгами
+#     recommendations = top_books[["Title", "Authors"]].to_dict(orient="records")
 
+#     # Объединяем книги в строку "Название - Автор" с разделителем "; "
+#     recommendations_str = "; ".join(f"{book['Title']} - {book['Authors']}" for book in recommendations)
+
+#     return recommendations, recommendations_str
+
+
+# def search_books_3_mode(user_input, selected_history, dataset):
+#     """
+#     Поиск книг в базе с учетом категории и вычисления косинусного сходства между описаниями книг и текстами ввода/истории.
+#     """
+#     # Получаем предпочтения из ввода и истории
+#     pref_input = get_preferences_from_input(user_input)
+#     pref_history = get_preferences_from_history(selected_history)
+
+#     # Объединяем предпочтения
+#     pref_combine = combine_preferences(pref_input, pref_history)
+#     preferences = pref_combine["tags"] + pref_combine["genres"]
+#     # Фильтруем книги, оставляя только те, которые содержат хотя бы одно совпадение с предпочтениями
+#     filtered_books = dataset[dataset["category"].apply(lambda x: any(pref in x for pref in preferences))].copy()
+#     print(filtered_books)
+    
+#     # Подсчет количества совпадений
+#     filtered_books["match_count"] = filtered_books["category"].apply(lambda x: sum(pref in x for pref in preferences))
+    
+#     # Сортировка по количеству совпадений в убывающем порядке
+#     top_books = filtered_books.sort_values(by="match_count", ascending=False).head(5)
+    
+#     # Формируем список словарей с книгами
+#     recommendations = top_books[["Title", "Authors"]].to_dict(orient="records")
+
+#     # Объединяем книги в строку "Название - Автор" с разделителем "; "
+#     recommendations_str = "; ".join(f"{book['Title']} - {book['Authors']}" for book in recommendations)
+
+#     return recommendations, recommendations_str
 
 # ------------------------------
 # Функция для формирования рекомендаций по предпочтениям пользователя
@@ -172,7 +252,7 @@ def get_book_recommendations(user_input, selected_book, mode, user_id, history_e
     recommendations = []
     if history_exclude_option:
         previously_recommended = load_recommendation_history(user_id)
-        dataset = dataset[~dataset['title'].isin(previously_recommended)]
+        dataset = dataset[~dataset['Title'].isin(previously_recommended)]
 
     if mode == 1:
         # Режим 1: объединение пользовательского ввода и истории
@@ -184,10 +264,10 @@ def get_book_recommendations(user_input, selected_book, mode, user_id, history_e
 
     elif mode == 3:
         # Режим 3: учитывать только книги из истории
-        recommendations = search_books_3_mode(user_input, selected_book, dataset)
+        recommendations= search_books_3_mode(user_input, selected_book, dataset)
 
     # Сохраняем историю рекомендованных книг
-    save_recommendation_history(user_id, [book['title'] for book in recommendations])
-
-    return recommendations
+    save_recommendation_history(user_id, [book['Title'] for book in recommendations])
+   
+    return format_books(recommendations)
 

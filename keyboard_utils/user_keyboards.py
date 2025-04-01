@@ -15,7 +15,7 @@ start_keyboard = InlineKeyboardMarkup(inline_keyboard=[[button_preferences], [bu
 # Кнопки выбора режима учета ранее рекомендованных книг
 button_exclude_prev_yes = KeyboardButton(text="Да")
 button_exclude_prev_no = KeyboardButton(text="Нет")
-exclude_prev_keyboard = ReplyKeyboardMarkup(keyboard=[[button_exclude_prev_yes], [button_exclude_prev_no]])
+exclude_prev_keyboard = ReplyKeyboardMarkup(keyboard=[[button_exclude_prev_yes], [button_exclude_prev_no]], resize_keyboard=True)
 remove_keyboard = ReplyKeyboardRemove()
 
 # ------------------------------

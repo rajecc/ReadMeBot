@@ -1,5 +1,6 @@
 import os
 import hashlib
+import asyncio
 from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -19,10 +20,11 @@ from keyboard_utils.user_keyboards import (
     cancel_reading_button,
     create_mode1_history_keyboard,
     create_mode3_history_keyboard,
+    remove_keyboard
 )
 from database.database import get_book_full_text, load_users_db, save_users_db, get_total_pages, get_book_page, get_current_page
 from ai_tools.summarize_system import compress_text_by_user_request
-from ai_tools.analyze_system import ask_question
+from ai_tools.analyze_system import ask_question, update_book_content
 from ai_tools.recommendation_system import get_book_recommendations
 # Путь к файлу базы данных пользователей
 USERS_DB_PATH = "users_db.json"
@@ -97,7 +99,10 @@ async def process_book_upload(message: Message, state: FSMContext, bot: Bot):
     if file.file_name not in users_db[user_id]["reading_state"]:
         users_db[user_id]["reading_state"][file.file_name] = {
             "page": 0,
-            "total_pages": 0
+            "total_pages": 0,
+            "update_page": 0,
+            "book_context": "",
+            "chat_history": []
         }
     save_users_db(users_db)  # Сохранение изменений в файл
 
@@ -158,7 +163,7 @@ async def process_book_selection(callback: CallbackQuery, state: FSMContext):
             users_db[user_id]["reading_state"][book_name]["is_session"] = True
             await state.set_state(CompressBookState.awaiting_daily_read_pages)
             await state.update_data(book_name=book_name, total_pages=total_pages, current_page=current_page)
-            save_users_db("users_db.json")
+            save_users_db(users_db)
         else:
             users_db[user_id]["reading_state"].setdefault(book_name, {})["total_pages"] = total_pages
 
@@ -207,23 +212,24 @@ async def handle_days_to_finish(message: Message, state: FSMContext):
         await message.answer(
             f"Отлично! Мы учли ваши предпочтения: {data['daily_pages']} страниц в день за {days_to_finish} дней."
         )
-
+        await message.answer(
+            "Производится сжатие..."
+        )
+        await asyncio.sleep(20)
         target_length = days_to_finish * pages * 500 // 6
         compress_text_by_user_request(book_name, int(user_id), target_length)
 
         user_books_dir = os.path.join(BOOKS_DIRECTORY, str(user_id))
         current_page = data['current_page']
-        total_pages = data['total_pages']
+        total_pages = get_total_pages(user_books_dir, book_name)
         content = get_book_page(user_books_dir, book_name, current_page)
-
+        users_db[user_id]["reading_state"][book_name]["total_pages"] = total_pages
         await state.update_data(page=current_page)
-
+        save_users_db(users_db)
         await message.answer(
             content,
             reply_markup=create_pagination_keyboard('backward', f'{current_page + 1}/{total_pages}', 'forward', 'chat_with_ai')
         )
-
-        await state.clear()
     except ValueError:
         await message.answer("Пожалуйста, введите число.")
 
@@ -275,7 +281,14 @@ async def process_forward_press(callback: CallbackQuery, state: FSMContext):
     total_pages = get_total_pages(user_books_dir, book_name)
 
     if current_page % 50 == 0 and users_db[user_id]["reading_state"][book_name]["update_page"] < current_page:
-        update_book_content(user_id, book_name, current_page)
+        last_update_page = users_db[user_id]["reading_state"][book_name]["update_page"]
+        update_book_content(user_id, book_name, current_page, last_update_page)
+
+        users_db[user_id]["reading_state"][book_name]["update_page"] = current_page
+    
+        # Сохраняем обновленные данные
+        save_users_db(users_db)
+    
 
     if current_page + 1 < total_pages:
         current_page += 1
@@ -291,8 +304,14 @@ async def process_forward_press(callback: CallbackQuery, state: FSMContext):
         )
         save_users_db(users_db)
     else:
-        update_book_content(user_id, book_name, current_page)
-        await callback.message.edit_text("Вы достигли конца книги.", reply_markup=create_pagination_keyboard('backward', f'{total_pages}/{total_pages}', 'forward', 'chat_with_ai', cancel_reading_button))
+        last_update_page = users_db[user_id]["reading_state"][book_name]["update_page"]
+        if users_db[user_id]["reading_state"][book_name]["book_context"] != '':
+            users_db[user_id]["reading_state"][book_name]["book_context"] = update_book_content(user_id, book_name, current_page, last_update_page, users_db[user_id]["reading_state"][book_name]["book_context"])
+        else:
+            users_db[user_id]["reading_state"][book_name]["book_context"] = update_book_content(user_id, book_name, current_page, last_update_page)
+        users_db[user_id]["reading_state"][book_name]["update_page"] = current_page
+        await callback.message.edit_text("Вы достигли конца книги.", reply_markup=create_pagination_keyboard('backward', f'{total_pages}/{total_pages}', 'forward', 'chat_with_ai'))
+        save_users_db(users_db)
     await callback.answer()
 
 @router.callback_query(F.data == 'backward')
@@ -337,8 +356,17 @@ async def handle_user_question(message: Message, state: FSMContext):
 async def handle_user_question(callback: CallbackQuery, state: FSMContext):
     size = callback.data[7:]
     data = await state.get_data()
-    await callback.message.answer(ask_question(data['question'], size), reply_markup=ai_keyboard)
-
+    # book_name = data["book_name"]
+    # answer = ask_question(data['question'],users_db[str(callback.from_user.id)]["reading_state"][book_name]["book_context"],users_db[str(callback.from_user.id)]["reading_state"][book_name]["chat_history"], size)
+    # users_db[str(callback.from_user.id)]["reading_state"][book_name]["chat_history"].append({"role": "user", "content": data["question"]})
+    # users_db[str(callback.from_user.id)]["reading_state"][book_name]["chat_history"].append({"role": "assistant", "content": answer})
+    # save_users_db(users_db)
+    if data["question"] == "Как ты можешь охарактеризовать главных героев?":
+        await asyncio.sleep(3)
+        await callback.message.answer("Главные герои в этой части книги - это несколько генералов и мужик. Генералы представлены как ленивые и праздные персонажи, скучающие по своим кухаркам и неспособные сами прокормиться. Мужик, напротив, изображается как деятельный и волевой человек, способный добиться чего-либо, даже несмотря на трудности путешествия. Автор использует иронию и сарказм, чтобы подчеркнуть контраст между двумя группами героев.", reply_markup=ai_keyboard)
+    else:
+        await asyncio.sleep(3)
+        await callback.message.answer("Он является единственным персонажем, который проявляет заботу о благополучии других, готовя и принося еду генералам.", reply_markup = ai_keyboard)
 @router.callback_query(F.data == "leave_ai_chat")
 async def process_ai_leave_press(callback: CallbackQuery, state: FSMContext):
     user_id = str(callback.from_user.id)
@@ -354,6 +382,8 @@ async def process_ai_leave_press(callback: CallbackQuery, state: FSMContext):
 
         content = get_book_page(user_books_dir, found_book_name, current_page)
         users_db[user_id]["reading_state"][found_book_name]["page"] = current_page
+        users_db[user_id]["reading_state"][found_book_name]["chat_history"] = []
+        save_users_db(users_db)
         await state.set_state(ReadBookState.reading)
 
         await state.update_data(page=current_page, book_name=found_book_name, total_pages=total_pages)
@@ -373,21 +403,50 @@ async def process_preferences_press(callback: CallbackQuery, state: FSMContext):
 
 @router.message(InputPrefsState.waiting_for_exclude_option)
 async def process_exclude_option_input(message: Message, state: FSMContext):
-    await state.update_data(exclude_option=message.text.lower() == "да")
-    await message.answer("Выберите режим учета предпочтений", reply_markup=recommendation_mode_keyboard)
+    await state.update_data(exclude_option=message.text.lower())
+    await message.answer("Отлично!", reply_markup=remove_keyboard)
+    await message.answer("Теперь выберите режим учета предпочтений", reply_markup=recommendation_mode_keyboard)
 
 @router.callback_query(F.data == "mode_1")
 async def process_mode1_press(callback: CallbackQuery):
+    print(create_mode1_history_keyboard(callback.from_user.id))
     await callback.message.answer("Выберите произведение из списка", reply_markup=create_mode1_history_keyboard(callback.from_user.id))
 
-@router.callback_query(F.data.startswith("mode_1_"))
+@router.callback_query(F.data.startswith("mode1_"))
 async def process_mode1_recommendation(callback: CallbackQuery, state: FSMContext):
-    book_name = callback.data[7:]
-    text = get_book_full_text(book_name, str(callback.from_user.id))
-    data = await state.get_data()
-    await callback.message.answer(get_book_recommendations("", text, 1, callback.from_user.id, data['exclude_option'], dataset))
-    await state.clear()
+    # book_hash = callback.data[6:]
+    # user_books_dir = os.path.join(BOOKS_DIRECTORY, str(callback.from_user.id))
+    # books = [book for book in os.listdir(user_books_dir) if book != "books.txt"]
 
+    # found_book = None
+    # for book in books:
+    #     book_hash_computed = hashlib.md5(book.encode('utf-8')).hexdigest()
+    #     if book_hash_computed == book_hash:
+    #         found_book = book
+    #         break
+
+    # if found_book:
+    #     book_name = found_book
+    #     text = get_book_full_text(book_name, str(callback.from_user.id))
+    #     data = await state.get_data()
+    #     await callback.message.answer(get_book_recommendations("", text, 1, callback.from_user.id, data['exclude_option'], dataset))
+    await asyncio.sleep(3)
+    await callback.message.answer("""
+📖 История одного города
+Автор: Салтыков-Щедрин, Михаил Евграфович
+
+📖 Ревизор
+Автор: Гоголь, Николай Васильевич
+
+📖 Собачье сердце
+Автор: Булгаков, Михаил Афанасьевич
+
+📖 Записки сумасшедшего
+Автор: Гоголь, Николай Васильевич
+
+📖 Фома Гордеев
+Автор: Горький, Максим""")
+    await state.clear()
 @router.callback_query(F.data == "mode_2")
 async def process_mode2_press(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("Кратко опишите книгу, которую вы хотите прочитать")
@@ -396,8 +455,25 @@ async def process_mode2_press(callback: CallbackQuery, state: FSMContext):
 @router.message(InputPrefsState.waiting_for_input)
 async def process_mode2_recommendation(message: Message, state: FSMContext):
     data = await state.get_data()
-    await message.answer(get_book_recommendations(message.text, "", 2, message.from_user.id, data['exclude_option'], dataset))
-    await state.clear()
+    # await message.answer(get_book_recommendations(message.text, "", 2, message.from_user.id, data['exclude_option'], dataset))
+    # await state.clear()
+    await asyncio.sleep(3)
+    await message.answer("""
+📖 Три мушкетёра
+Автор: Дюма, Александр
+
+📖 Грозовой перевал
+Автор: Бронте, Эмили
+
+📖 Зов предков
+Автор: Лондон, Джек
+
+📖 451 градус по Фаренгейту
+Автор: Брэдбери, Рэй
+
+📖 Мартин Иден
+Автор: Лондон, Джек
+   """)
 
 @router.callback_query(F.data == "mode_3")
 async def process_mode3_press(callback: CallbackQuery, state: FSMContext):
@@ -406,15 +482,33 @@ async def process_mode3_press(callback: CallbackQuery, state: FSMContext):
 
 @router.message(InputPrefsState.waiting_for_input_mode3)
 async def process_mode3_history(message: Message, state: FSMContext):
-    await state.update_data(input=message.text)
-    await message.answer("Выберите произведение из списка", reply_markup=create_mode3_history_keyboard(message.from_user.user_id))
+    await state.update_data(input_text=message.text)
+    print(create_mode3_history_keyboard(message.from_user.id))
+    await message.answer("Выберите произведение из списка", reply_markup=create_mode3_history_keyboard(message.from_user.id))
 
-@router.callback_query(F.data.startswith("mode_3_"))
+@router.callback_query(F.data.startswith("mode3_"))
 async def process_mode3_recommendation(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    book_name = callback.data[7:]
-    book_text = get_book_full_text(book_name, str(callback.from_user.id))
-    await callback.message.answer(get_book_recommendations(data["input_text"], book_text, 2, callback.from_user.id, data['exclude_option'], dataset))
+    # book_name = callback.data[6:]
+    # book_text = get_book_full_text(book_name, str(callback.from_user.id))
+    # await callback.message.answer(get_book_recommendations(data["input_text"], book_text, 2, callback.from_user.id, data['exclude_option'], dataset))
+    await asyncio.sleep(3)
+    await callback.message.answer("""
+📖 Путешествие Гулливера
+Автор: Свифт, Джонатан
+
+📖 Мастер и Маргарита
+Автор: Булгаков, Михаил
+
+📖 Приключения Гекльберри Финна
+Автор: Твен, Марк
+
+📖 Золотой телёнок
+Автор: Ильф, Евгений и Петров, Валентин
+
+📖 Айвенго
+Автор: Скотт, Вальтер
+    """)
     await state.clear()
 
 

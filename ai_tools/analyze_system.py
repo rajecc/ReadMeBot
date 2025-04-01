@@ -1,14 +1,11 @@
+from googletrans import Translator
 from typing import List, Dict
 from huggingface_hub import InferenceClient
+from database.database import get_book_full_text, save_users_db, get_total_pages
 
 # Инициализация клиента для модели анализа (например, DeepSeek)
-client = InferenceClient(provider="together", api_key="your_api_key")
-model = "deepseek-ai/DeepSeek-V3"
-
-# Глобальные переменные для хранения контекста книги и истории чата
-book_context = ""
-chat_history = []
-
+client = InferenceClient(provider="hf-inference", api_key="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")
+model = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 # ------------------------------
 # Функция для определения типа текста
 def determine_text_type(text: str) -> str:
@@ -16,15 +13,30 @@ def determine_text_type(text: str) -> str:
     Определить тип текста (например, учебный, научно-популярный, научный, художественный)
     на основе его фрагмента. Возвращается один из типов.
     """
+    PROMPT_TEMPLATE = '''Analyze the given text and determine its type (e.g., scientific, literary, journalistic, technical, philosophical, etc.). Based on the identified type, extract only the key parameters that characterize this type of text.  
+
+        Output the result strictly as a comma-separated list of parameters in russian without any additional text.  
+
+        Examples of key parameters for different text types:  
+        - **Literary: персонажи, сюжет, настроение, стиль повествования, конфликты, символика, описание среды  
+        - **Scientific: основные термины, гипотезы, методы, доказательства, выводы  
+        - **Journalistic: ключевые события, участники, место, время, аргументы  
+        - **Technical: предмет описания, термины, инструкции, алгоритмы, примеры  
+        - **Philosophical: основные идеи, аргументы, философские термины, парадоксы, концепции  
+
+        Text:  
+        "{text}"  
+        
+        '''
     # Берём средний фрагмент текста
     mid_point = len(text) // 2
     fragment = text[max(mid_point - 500, 0): mid_point + 500]
+
     messages = [
         {
             "role": "user",
             "content": (
-                "Определи тип данного текста, выбери один из вариантов: учебный, научно-популярный, научный, художественный. "
-                f"Вот фрагмент: {fragment}"
+                PROMPT_TEMPLATE.format(text=fragment)
             )
         }
     ]
@@ -51,10 +63,10 @@ def extract_tags_and_genres(text: str) -> Dict[str, List[str]]:
             "role": "user",
             "content": (
                     "Extract tags from the following text about books preferences. "
-                    "Write only tags separated by commas in Russian: " + text
+                    "Write only tags separated only by commas.One word for one tag. The first letter of each tag must be capitalized.: " + text
             )
         }],
-        max_tokens=500
+        max_tokens=100
     )
     tags = [tag.strip() for tag in response_tags.choices[0].message.content.split(",") if tag.strip()]
 
@@ -78,7 +90,7 @@ def extract_tags_and_genres(text: str) -> Dict[str, List[str]]:
 
 # ------------------------------
 # Функция для ответа на вопрос пользователя с регулируемой длиной ответа
-def ask_question(question: str, answer_mode: str = "detailed") -> str:
+def ask_question(question: str, book_context: str, chat_history: list ,answer_mode: str = "detailed") -> str:
     """
     Ответить на вопрос пользователя по содержанию книги.
     Параметр answer_mode задаёт режим длины ответа:
@@ -88,23 +100,17 @@ def ask_question(question: str, answer_mode: str = "detailed") -> str:
 
     Если режим не "detailed", то полученный подробный ответ сжимается с использованием системы сжатия.
     """
-    global chat_history
-    chat_history.append({"role": "user", "content": question})
-
     messages = [
                    {"role": "system",
-                    "content": (
-                        "Ты — AI-ассистент, специализирующийся на анализе содержания книг. "
-                        "Отвечай подробно на вопросы, анализируй стилистику, символизм и темы произведения. "
-                        "Отвечай на русском языке."
-                    )},
-                   {"role": "user", "content": f"Вот текущий контекст книги:\n{book_context}"}
-               ] + chat_history
+                    "content":
+                        "You are an AI assistant specializing in analyzing the content of books. Answer questions in detail, analyzing the style, symbolism, and themes of the work. Answer very shortly. Answer only in Russian."
+                    },] + chat_history + [{ "role": "user","content": f"Here is the current context of the book:\n{book_context}\nHere is the question: {question}"}
+]
 
     completion = client.chat.completions.create(
         model=model,
         messages=messages,
-        max_tokens=1000
+        max_tokens=300
     )
     detailed_answer = completion.choices[0].message.content
 
@@ -124,23 +130,17 @@ def ask_question(question: str, answer_mode: str = "detailed") -> str:
         final_answer = adjusted_answer
     else:
         final_answer = detailed_answer
-
-    chat_history.append({"role": "assistant", "content": final_answer})
     return final_answer
 
 
-def update_book_content(user_id: str, book_name: str, current_page: int, final_target_size: int = 100):
+def update_book_content(user_id: str, book_name: str, current_page: int, last_update_page: int, book_context: str = "",final_target_size: int = 200):
     """
     Дополняет контекст книги сжатыми последними прочитанными страницами.
     """
-    global book_context
     
     # Получаем полный текст книги
     full_text = get_book_full_text(book_name, user_id).split()  # Разделяем на слова для имитации страниц
     total_pages = get_total_pages("books", book_name)  # Вычисляем общее количество страниц
-    
-    # Определяем последнюю обновленную страницу
-    last_update_page = users_db[user_id]["reading_state"][book_name]["update_page"]
     
     # Если текущая страница последняя в книге, берем текст от последнего обновления до конца
     if current_page >= total_pages:
@@ -148,29 +148,17 @@ def update_book_content(user_id: str, book_name: str, current_page: int, final_t
     else:
         recent_text = " ".join(full_text[(last_update_page - 1) * 500: current_page * 500])
     
-    if text_type == None:
-        text_type = determine_text_type(recent_text)
+    text_type = determine_text_type(recent_text)
     
     # Сжимаем текст
+    from ai_tools.summarize_system import compress_text
     compressed_text = compress_text(recent_text, final_target_size=final_target_size, text_type=text_type)
-    
+
+    print(compressed_text)
     # Дополняем контекст книги
     book_context += "\n" + compressed_text
     
-    # Обновляем отметку последнего обновления
-    users_db[user_id]["reading_state"][book_name]["update_page"] = current_page
-    
-    # Сохраняем обновленные данные
-    save_users_db(users_db)
-    
     return book_context
 
-# ------------------------------
-# Функция для сброса истории чата
-def reset_chat():
-    """
-    Сбросить историю чата.
-    """
-    global chat_history
-    chat_history = []
+
 

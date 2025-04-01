@@ -44,7 +44,7 @@ def update_reading_state(user_id, book_name, page, total_pages):
 # ------------------------------
 # Функции работы с книгами
 
-def get_total_pages(user_books_dir, book_name, page_size=500):
+def get_total_pages(user_books_dir, book_name, page_size=1000):
     """
     Вычисляет общее количество страниц книги.
     """
